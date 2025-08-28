@@ -56,10 +56,15 @@ export default {
                 return await handleEditCollection(request, env.DB, collectionId);
             }
 
-            // 新增：删除集合的API端点
+            // 删除集合的API端点
             if (path.startsWith('/admin/delete/') && request.method === 'DELETE') {
                 const collectionId = path.split('/')[3];
                 return await handleDeleteCollection(request, env.DB, collectionId);
+            }
+
+            // 批量删除集合的API端点
+            if (path === '/admin/delete-multiple' && request.method === 'POST') {
+                return await handleDeleteMultiple(request, env.DB);
             }
 
             // 默认返回主页面
@@ -123,7 +128,7 @@ async function initializeDatabase(db) {
         CREATE TABLE IF NOT EXISTS sheet_music (
           id INTEGER PRIMARY KEY AUTOINCREMENT,
           song_id INTEGER NOT NULL,
-          image_url TEXT NOT NULL,
+          image_url TEXT NOT NOT NULL,
           sort_order INTEGER DEFAULT 0,
           FOREIGN KEY (song_id) REFERENCES songs(id) ON DELETE CASCADE
         )
@@ -377,11 +382,34 @@ async function handleSavePassword(request, db) {
     }
 }
 
-// 获取所有集合列表
+// 获取所有集合列表（支持分页）
 async function handleGetCollections(request, db) {
     try {
-        const collections = await db.prepare('SELECT id, collection_name, collection_week_label, publish_date FROM song_collections ORDER BY created_at DESC').all();
-        return new Response(JSON.stringify({ success: true, collections: collections.results || [] }), {
+        const url = new URL(request.url);
+        let page = parseInt(url.searchParams.get('page')) || 1;
+        let perPage = parseInt(url.searchParams.get('perPage')) || 10;
+        if (page < 1) page = 1;
+        if (perPage < 1) perPage = 10;
+
+        const offset = (page - 1) * perPage;
+
+        const totalResult = await db.prepare('SELECT COUNT(*) as total FROM song_collections').first();
+        const total = totalResult.total;
+
+        const collections = await db.prepare(`
+            SELECT id, collection_name, collection_week_label, publish_date 
+            FROM song_collections 
+            ORDER BY created_at DESC 
+            LIMIT ? OFFSET ?
+        `).bind(perPage, offset).all();
+
+        return new Response(JSON.stringify({ 
+            success: true, 
+            collections: collections.results || [], 
+            total,
+            page,
+            perPage
+        }), {
             headers: { 'Content-Type': 'application/json' }
         });
     } catch (error) {
@@ -416,7 +444,7 @@ async function handleEditCollection(request, db, collectionId) {
     }
 }
 
-// 新增：处理删除集合
+// 处理删除集合
 async function handleDeleteCollection(request, db, collectionId) {
     try {
         if (!collectionId) {
@@ -441,6 +469,41 @@ async function handleDeleteCollection(request, db, collectionId) {
         }
     } catch (error) {
         console.error('Error deleting collection:', error);
+        return new Response(JSON.stringify({ success: false, error: error.message }), {
+            status: 500,
+            headers: { 'Content-Type': 'application/json' }
+        });
+    }
+}
+
+// 处理批量删除集合
+async function handleDeleteMultiple(request, db) {
+    try {
+        const formData = await request.formData();
+        const ids = JSON.parse(formData.get('ids')) || [];
+
+        if (!Array.isArray(ids) || ids.length === 0) {
+            return new Response(JSON.stringify({ success: false, error: 'No collection IDs provided' }), {
+                status: 400,
+                headers: { 'Content-Type': 'application/json' }
+            });
+        }
+
+        const placeholders = ids.map(() => '?').join(',');
+        const result = await db.prepare(`DELETE FROM song_collections WHERE id IN (${placeholders})`).bind(...ids).run();
+
+        if (result.meta.changes > 0) {
+            return new Response(JSON.stringify({ success: true, message: 'Collections deleted successfully' }), {
+                headers: { 'Content-Type': 'application/json' }
+            });
+        } else {
+            return new Response(JSON.stringify({ success: false, error: 'No collections found to delete' }), {
+                status: 404,
+                headers: { 'Content-Type': 'application/json' }
+            });
+        }
+    } catch (error) {
+        console.error('Error deleting multiple collections:', error);
         return new Response(JSON.stringify({ success: false, error: error.message }), {
             status: 500,
             headers: { 'Content-Type': 'application/json' }
@@ -1119,6 +1182,11 @@ async function generateHomePage(db) {
               currentWeek: { currentIndex: 0, totalSlides: 0 },
               nextWeek: { currentIndex: 0, totalSlides: 0 }
           };
+          // 存储歌曲和歌谱的映射关系
+          const songSheetMap = {
+              currentWeek: ${JSON.stringify(currentWeek.songs || [])},
+              nextWeek: ${JSON.stringify(nextWeek.songs || [])}
+          };
   
           // 初始化轮播状态
           document.addEventListener('DOMContentLoaded', function() {
@@ -1164,7 +1232,7 @@ async function generateHomePage(db) {
               document.querySelector(\`[onclick="switchMainTab('\${tabId}')"]\`).classList.add('active');
           }
   
-          // 播放音频
+          // 播放音频并切换到对应歌谱
           function playAudio(url, title, playlistType, songIndex) {
               if (!url) return;
   
@@ -1190,6 +1258,21 @@ async function generateHomePage(db) {
               currentAudio.play();
               isPlaying = true;
               document.getElementById('playPauseBtn').textContent = '⏸';
+  
+              // 切换到对应歌曲的歌谱
+              const slides = document.getElementById(\`\${playlistType}Slides\`);
+              if (slides && carouselStates[playlistType].totalSlides > 0) {
+                  let targetIndex = 0;
+                  // 计算该歌曲的第一张歌谱的索引
+                  for (let i = 0; i < songIndex; i++) {
+                      targetIndex += (songSheetMap[playlistType][i]?.sheets?.length || 0);
+                  }
+                  // 如果歌曲有歌谱，切换到第一张歌谱
+                  if (songSheetMap[playlistType][songIndex]?.sheets?.length > 0) {
+                      carouselStates[playlistType].currentIndex = targetIndex;
+                      updateCarousel(playlistType);
+                  }
+              }
           }
   
           // 切换播放/暂停
@@ -1592,6 +1675,32 @@ async function generateAdminPage(db) {
               margin: 0 auto;
           }
   
+          .pagination {
+              display: flex;
+              justify-content: center;
+              margin-top: 20px;
+              gap: 10px;
+          }
+  
+          .pagination button {
+              padding: 8px 15px;
+              border: none;
+              border-radius: 5px;
+              cursor: pointer;
+              background: #2a5298;
+              color: white;
+          }
+  
+          .pagination button:disabled {
+              background: #ccc;
+              cursor: not-allowed;
+          }
+  
+          .pagination span {
+              align-self: center;
+              color: #333;
+          }
+  
           @media (max-width: 768px) {
               .admin-container {
                   padding: 10px;
@@ -1644,7 +1753,7 @@ async function generateAdminPage(db) {
       </style>
   </head>
   <body>
-      <button class="back-btn" onclick="window.location.href='/'">← 返回主页</button>
+      <button class="back-btn" onclick="window.location.href='/'">← 返回用户端界面</button>
   
       <div class="admin-container">
           <div class="admin-header">
@@ -1697,8 +1806,15 @@ async function generateAdminPage(db) {
           <!-- 历史周次管理 -->
           <div class="admin-tab-content" id="collectionHistory" style="display: none;">
               <h2 style="text-align: center; color: #2a5298; margin-bottom: 20px;">以往周次管理</h2>
+              <div style="display: flex; justify-content: space-between; margin-bottom: 10px;">
+                  <label><input type="checkbox" id="selectAll" onclick="toggleSelectAll()"> 全选</label>
+                  <button class="delete-btn" onclick="batchDelete()">批量删除</button>
+              </div>
               <div class="collections-list" id="collectionsList">
                   <p style="text-align: center; padding: 20px;">加载中...</p>
+              </div>
+              <div class="pagination" id="pagination">
+                  <!-- 分页控件将动态添加 -->
               </div>
           </div>
       </div>
@@ -1706,10 +1822,13 @@ async function generateAdminPage(db) {
       <script>
           let songCount = 0;
           let currentCollectionId = null;
+          let currentPage = 1;
+          let perPage = 10;
+          let totalCollections = 0;
   
           // 初始化页面
           document.addEventListener('DOMContentLoaded', function() {
-              loadCollections();
+              loadCollections(currentPage);
               addSong(); // 默认添加一首歌曲
           });
   
@@ -1721,7 +1840,7 @@ async function generateAdminPage(db) {
               document.querySelector(\`[onclick="switchAdminTab('\${tabId}')"]\`).classList.add('active');
   
               if (tabId === 'collectionHistory') {
-                  loadCollections();
+                  loadCollections(currentPage);
               }
           }
   
@@ -1849,18 +1968,19 @@ async function generateAdminPage(db) {
               }
           }
   
-          // 加载集合列表
-          async function loadCollections() {
+          // 加载集合列表（分页）
+          async function loadCollections(page = 1) {
               const collectionsList = document.getElementById('collectionsList');
               collectionsList.innerHTML = '<p style="text-align: center; padding: 20px;">加载中...</p>';
   
               try {
-                  const response = await fetch('/admin/collections');
+                  const response = await fetch(\`/admin/collections?page=\${page}&perPage=\${perPage}\`);
                   const result = await response.json();
   
                   if (result.success && result.collections.length > 0) {
                       collectionsList.innerHTML = result.collections.map(collection => \`
                           <div class="collection-item">
+                              <input type="checkbox" class="collection-checkbox" value="\${collection.id}">
                               <div class="collection-info">
                                   <h3>\${collection.collection_name}</h3>
                                   <p>周次标签: \${collection.collection_week_label} | 发布日期: \${collection.publish_date}</p>
@@ -1871,12 +1991,68 @@ async function generateAdminPage(db) {
                               </div>
                           </div>
                       \`).join('');
+                      totalCollections = result.total;
+                      currentPage = result.page;
+                      updatePagination();
                   } else {
                       collectionsList.innerHTML = '<p style="text-align: center; padding: 20px;">暂无历史周次数据</p>';
                   }
               } catch (error) {
                   console.error('Load collections error:', error);
                   collectionsList.innerHTML = '<p style="text-align: center; padding: 20px; color: red;">加载失败</p>';
+              }
+          }
+  
+          // 更新分页控件
+          function updatePagination() {
+              const pagination = document.getElementById('pagination');
+              const totalPages = Math.ceil(totalCollections / perPage);
+              pagination.innerHTML = \`
+                  <button onclick="loadCollections(\${currentPage - 1})" \${currentPage === 1 ? 'disabled' : ''}>上一页</button>
+                  <span>第 \${currentPage} / \${totalPages} 页</span>
+                  <button onclick="loadCollections(\${currentPage + 1})" \${currentPage === totalPages ? 'disabled' : ''}>下一页</button>
+              \`;
+          }
+  
+          // 全选/取消全选
+          function toggleSelectAll() {
+              const selectAll = document.getElementById('selectAll');
+              document.querySelectorAll('.collection-checkbox').forEach(checkbox => {
+                  checkbox.checked = selectAll.checked;
+              });
+          }
+  
+          // 批量删除
+          async function batchDelete() {
+              const selectedIds = Array.from(document.querySelectorAll('.collection-checkbox:checked')).map(checkbox => checkbox.value);
+              if (selectedIds.length === 0) {
+                  alert('请选择要删除的周次');
+                  return;
+              }
+  
+              if (!confirm(\`确定要删除选中的 \${selectedIds.length} 个周次吗？此操作不可恢复！\`)) {
+                  return;
+              }
+  
+              const formData = new FormData();
+              formData.append('ids', JSON.stringify(selectedIds));
+  
+              try {
+                  const response = await fetch('/admin/delete-multiple', {
+                      method: 'POST',
+                      body: formData
+                  });
+  
+                  const result = await response.json();
+                  if (result.success) {
+                      alert('批量删除成功！');
+                      loadCollections(currentPage); // 重新加载当前页
+                  } else {
+                      alert('批量删除失败: ' + result.error);
+                  }
+              } catch (error) {
+                  console.error('Batch delete error:', error);
+                  alert('批量删除失败');
               }
           }
   
@@ -1945,7 +2121,7 @@ async function generateAdminPage(db) {
   
           // 删除集合
           async function deleteCollection(collectionId, collectionName) {
-              if (!confirm(\`确定要删除周次 "\${collectionName}" 吗？此操作不可恢复！\`)) {
+             if (!confirm(\`确定要删除周次 "\${collectionName}" 吗？此操作不可恢复！\`)) {
                   return;
               }
   
@@ -1957,7 +2133,7 @@ async function generateAdminPage(db) {
                   const result = await response.json();
                   if (result.success) {
                       alert('删除成功！');
-                      loadCollections(); // 重新加载列表
+                      loadCollections(currentPage); // 重新加载当前页
                   } else {
                       alert('删除失败: ' + result.error);
                   }
