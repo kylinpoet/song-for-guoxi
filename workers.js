@@ -1,4 +1,4 @@
-// 基督教歌曲导航 - Cloudflare Workers with D1
+// 基督教歌曲导航 - Cloudflare Workers with D1 & R2
 export default {
     async fetch(request, env, ctx) {
         const url = new URL(request.url);
@@ -21,26 +21,66 @@ export default {
                 return await handleSaveData(request, env.DB);
             }
 
-            // 歌谱上传功能，这里仍是模拟返回URL，实际需要对接云存储
+            // 歌谱上传功能，对接 Cloudflare R2
             if (path === '/admin/upload-sheet' && request.method === 'POST') {
-                const formData = await request.formData();
-                const file = formData.get('sheetFile');
-                if (!file) {
-                    return new Response(JSON.stringify({ success: false, error: '没有选择文件' }), {
-                        status: 400,
+                 try {
+                    const formData = await request.formData();
+                    const file = formData.get('sheetFile');
+    
+                    // 检查文件是否存在且是文件类型
+                    if (!file || typeof file === 'string') {
+                        return new Response(JSON.stringify({ success: false, error: '没有选择文件或上传数据无效' }), {
+                            status: 400,
+                            headers: { 'Content-Type': 'application/json' }
+                        });
+                    }
+    
+                    // 检查 R2 Bucket 是否已在 wrangler.toml 中绑定
+                    if (!env.GXSONGPIC) {
+                         console.error('GXSONGPIC is not bound. Please check your wrangler.toml configuration.');
+                         return new Response(JSON.stringify({ success: false, error: '服务器存储配置错误' }), {
+                            status: 500,
+                            headers: { 'Content-Type': 'application/json' }
+                        });
+                    }
+                    
+                    // 1. 清理文件名，防止不安全字符
+                    const sanitizedFilename = file.name.replace(/[^a-zA-Z0-9-._]/g, '_');
+    
+                    // 2. 创建一个唯一的对象 key (文件名)，防止重名覆盖
+                    // 格式: sheets/时间戳-随机字符串-原始文件名
+                    const key = `sheets/${Date.now()}-${Math.random().toString(36).substring(2, 10)}-${sanitizedFilename}`;
+    
+                    // 3. 上传文件到 R2
+                    const uploadedObject = await env.GXSONGPIC.put(key, file.stream(), {
+                        httpMetadata: {
+                            contentType: file.type || 'application/octet-stream', // 设置正确的MIME类型
+                        },
+                    });
+                    
+                    if (!uploadedObject) {
+                        throw new Error('R2 upload failed, returned object is null.');
+                    }
+    
+                    // 4. 构建公开访问的 URL (使用您的自定义域)
+                    const customDomain = 'https://r2-gxsongpic.831017.xyz';
+                    const imageUrl = `${customDomain}/${uploadedObject.key}`;
+    
+                    // 5. 返回成功的 JSON 响应
+                    return new Response(JSON.stringify({
+                        success: true,
+                        imageUrl: imageUrl
+                    }), {
+                        headers: { 'Content-Type': 'application/json' }
+                    });
+    
+                } catch (error) {
+                    console.error('Upload Error:', error);
+                    return new Response(JSON.stringify({ success: false, error: '文件上传失败: ' + error.message }), {
+                        status: 500,
                         headers: { 'Content-Type': 'application/json' }
                     });
                 }
-                // 实际应用中，这里需要将文件上传到R2或其他云存储，并返回可访问的URL
-                // 示例：const uploadResult = await env.R2_BUCKET.put(`${Date.now()}_${file.name}`, file.stream());
-                // const imageUrl = `https://your-r2-domain/${uploadResult.key}`;
-                const imageUrl = `https://example.com/sheets/${Date.now()}_${file.name.replace(/[^a-zA-Z0-9.]/g, '_')}`;
-                return new Response(JSON.stringify({
-                    success: true,
-                    imageUrl: imageUrl
-                }), {
-                    headers: { 'Content-Type': 'application/json' }
-                });
             }
 
             if (path === '/admin/save-password' && request.method === 'POST') {
@@ -128,7 +168,7 @@ async function initializeDatabase(db) {
         CREATE TABLE IF NOT EXISTS sheet_music (
           id INTEGER PRIMARY KEY AUTOINCREMENT,
           song_id INTEGER NOT NULL,
-          image_url TEXT NOT NOT NULL,
+          image_url TEXT NOT NULL,
           sort_order INTEGER DEFAULT 0,
           FOREIGN KEY (song_id) REFERENCES songs(id) ON DELETE CASCADE
         )
@@ -1877,8 +1917,9 @@ async function generateAdminPage(db) {
           async function handleSheetUpload(input, songIndex) {
               const files = input.files;
               const previewDiv = document.getElementById(\`sheetPreview_\${songIndex}\`);
-              previewDiv.innerHTML = '';
+              previewDiv.innerHTML = '上传中，请稍候...';
   
+              let sheetUrlInputs = '';
               for (let i = 0; i < files.length; i++) {
                   const file = files[i];
                   const formData = new FormData();
@@ -1892,23 +1933,29 @@ async function generateAdminPage(db) {
   
                       const result = await response.json();
                       if (result.success) {
-                          const img = document.createElement('img');
-                          img.src = result.imageUrl;
-                          img.alt = '歌谱预览';
-                          previewDiv.appendChild(img);
-  
                           // 创建隐藏输入框存储URL
-                          const hiddenInput = document.createElement('input');
-                          hiddenInput.type = 'hidden';
-                          hiddenInput.name = \`song_\${songIndex}_sheet_\${i}\`;
-                          hiddenInput.value = result.imageUrl;
-                          previewDiv.appendChild(hiddenInput);
+                          sheetUrlInputs += \`<input type="hidden" name="song_\${songIndex}_sheet_\${i}" value="\${result.imageUrl}">\`;
+                      } else {
+                          alert('文件 ' + file.name + ' 上传失败: ' + result.error);
                       }
                   } catch (error) {
                       console.error('Upload error:', error);
-                      alert('上传失败');
+                      alert('文件 ' + file.name + ' 上传失败');
                   }
               }
+              
+              // 上传完成后，重新渲染预览和隐藏输入框
+              previewDiv.innerHTML = '';
+              previewDiv.insertAdjacentHTML('beforeend', sheetUrlInputs);
+              
+              // 重新生成预览图
+              const hiddenInputs = previewDiv.querySelectorAll('input[type="hidden"]');
+              hiddenInputs.forEach(hiddenInput => {
+                const img = document.createElement('img');
+                img.src = hiddenInput.value;
+                img.alt = '歌谱预览';
+                previewDiv.appendChild(img);
+              });
           }
   
           // 提交表单
